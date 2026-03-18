@@ -2,242 +2,179 @@ import os
 import logging
 import feedparser
 import requests
+import asyncio
+import sys
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION & ENVIRONNEMENT ---
 load_dotenv()
+# Utilisation de la clé OpenRouter fournie
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- UTILS ---
+# --- 2. UTILITAIRES LLM ---
 async def get_llm_response(prompt):
+    """Appel simple pour les Bots 1 et 2"""
     response = client.chat.completions.create(
         model="google/gemini-2.0-flash-001",
         messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
 
-# --- GESTION DES FICHIERS ---
-async def set_document_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd = update.message.text.split()[0][4:] # Récupère 'cv', 'fiche' ou 'interviewer'
-    context.user_data['waiting_for'] = cmd
-    await update.message.reply_text(f"Envoie maintenant le fichier .md pour : {cmd}")
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc_type = context.user_data.get('waiting_for')
-    if not doc_type:
-        await update.message.reply_text("Utilise d'abord /setcv, /setfiche ou /setinterviewer")
-        return
-
-    file = await context.bot.get_file(update.message.document.file_id)
-    content = await file.download_as_bytearray()
-    context.user_data[doc_type] = content.decode("utf-8")
-    context.user_data['waiting_for'] = None
-    await update.message.reply_text(f"✅ {doc_type.upper()} enregistré !")
-
-# --- COMMANDES DES BOTS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot prêt. Commandes : /setcv, /setfiche, /setinterviewer, /parse, /cv, /entretien /stop")
-
-async def parse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1. Vérifier si on a le CV en mémoire
-    cv_content = context.user_data.get('cv')
-    if not cv_content:
-        await update.message.reply_text("❌ Erreur : Je n'ai pas ton CV. Envoie /setcv puis ton fichier .md d'abord.")
-        return
-
-    await update.message.reply_text("🔍 Je fouille le flux RSS pour trouver des pépites...")
-
-    # 2. Récupérer le flux RSS
-    rss_url = os.getenv("RSS_URL")
-    feed = feedparser.parse(rss_url)
-    
-    # --- MODE DÉMO SI FLUX VIDE ---
-    if not feed.entries:
-        await update.message.reply_text("⚠️ Flux RSS vide, passage en mode démo avec des offres fictives...")
-        job_list = [
-            "Titre: Stagiaire Data Scientist - Google Paris\nLien: https://google.com\nDescription: Nous cherchons un étudiant de l'ESIEE sachant coder en Python et intéressé par les LLMs.\n---",
-            "Titre: Développeur Web Junior - Ubisoft\nLien: https://ubisoft.com\nDescription: Stage en C++ et Python pour du rendu graphique en temps réel.\n---",
-            "Titre: Expert Excel - Cabinet Comptable Martin\nLien: https://martin.fr\nDescription: Saisie de données comptables sur tableur toute la journée.\n---"
-        ]
-    else:
-        # On prépare la liste à partir du vrai flux
-        job_list = []
-        for entry in feed.entries[:5]:
-            job_list.append(f"Titre: {entry.title}\nLien: {entry.link}\nDescription: {entry.summary}\n---")
-    # ------------------------------
-
-    jobs_text = "\n".join(job_list)
-
-    # On prépare une liste simplifiée des 5 dernières offres
-    job_list = []
-    for entry in feed.entries[:5]: # On limite à 5 pour ne pas surcharger l'IA
-        job_list.append(f"Titre: {entry.title}\nLien: {entry.link}\nDescription: {entry.summary}\n---")
-
-    jobs_text = "\n".join(job_list)
-
-    # 3. Le Prompt pour l'IA
-    prompt = f"""
-    Tu es un expert en recrutement. Voici mon CV en Markdown :
-    {cv_content}
-
-    Voici les dernières offres de stages trouvées :
-    {jobs_text}
-
-    Analyse ces offres. Sélectionne les 2 ou 3 meilleures pour moi.
-    Pour chaque offre sélectionnée, donne-moi :
-    1. Le titre et le lien.
-    2. Pourquoi c'est un bon match (justification).
-    3. Un conseil rapide pour adapter mon CV à cette offre.
-    
-    Réponds de manière concise et encourageante en Markdown.
-    """
-
-    # 4. Appel à OpenRouter
-    try:
-        analyse = await get_llm_response(prompt)
-        
-        try:
-            # On tente l'affichage joli en Markdown
-            await update.message.reply_text(analyse, parse_mode='Markdown')
-        except Exception:
-            # Si Telegram râle sur le Markdown, on envoie en texte brut
-            await update.message.reply_text("⚠️ (Affichage simplifié car le Markdown était mal formé) :\n\n" + analyse)
-            
-    except Exception as e:
-        await update.message.reply_text(f"Oups, l'IA a eu un bug : {e}")
-
-async def cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cv = context.user_data.get('cv')
-    fiche = context.user_data.get('fiche')
-
-    if not cv or not fiche:
-        await update.message.reply_text("❌ Il me manque le CV (/setcv) ou la fiche de poste (/setfiche) !")
-        return
-
-    await update.message.reply_text("📊 Analyse du 'match' en cours... Prépare-toi, je vais être honnête.")
-
-    prompt = f"""
-    Analyse la correspondance entre ce CV et cette offre d'emploi.
-    
-    CV :
-    {cv}
-    
-    OFFRE :
-    {fiche}
-    
-    Donne un rapport structuré :
-    1. Score de match (sur 100).
-    2. Points forts (ce qui colle parfaitement).
-    3. Gaps critiques (ce qui manque pour être pris).
-    4. Reformulations concrètes : Propose 2 phrases de mon CV à modifier pour mieux répondre aux mots-clés de l'offre.
-    5. Message LinkedIn : Un court message pour contacter le recruteur.
-    """
-
-    try:
-        reponse = await get_llm_response(prompt)
-        # On utilise le même système de secours pour le Markdown
-        try:
-            await update.message.reply_text(reponse, parse_mode='Markdown')
-        except:
-            await update.message.reply_text(reponse)
-    except Exception as e:
-        await update.message.reply_text(f"Erreur : {e}")
-
-async def entretien_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cv = context.user_data.get('cv')
-    fiche = context.user_data.get('fiche')
-    interviewer = context.user_data.get('interviewer')
-
-    if not all([cv, fiche, interviewer]):
-        await update.message.reply_text("❌ Il me manque des documents (CV, Fiche ou Interviewer).")
-        return
-
-    # Initialisation de l'historique avec le "System Prompt"
-    context.user_data['messages'] = [
-        {"role": "system", "content": f"""
-        Tu es {interviewer}. Tu fais passer un entretien pour le poste : {fiche}.
-        Le candidat est : {cv}.
-        
-        CONSIGNES :
-        1. Reste dans ton personnage à 100%.
-        2. Pose UNE SEULE question à la fois.
-        3. Après chaque réponse du candidat, donne ton feedback de coach entre crochets [COACH: ...] puis continue l'entretien.
-        4. Sois exigeant mais juste.
-        """}
-    ]
-    
-    # Premier message du recruteur
-    first_prompt = "Commence l'entretien, présente-toi brièvement et pose la première question."
-    context.user_data['messages'].append({"role": "user", "content": first_prompt})
-    
-    response = await get_llm_response_from_history(context.user_data['messages'])
-    context.user_data['messages'].append({"role": "assistant", "content": response})
-    
-    await update.message.reply_text(response)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Si on n'est pas en mode entretien, on ignore
-    if 'messages' not in context.user_data:
-        await update.message.reply_text("Tape /entretien pour commencer une simulation.")
-        return
-
-    user_answer = update.message.text
-    context.user_data['messages'].append({"role": "user", "content": user_answer})
-
-    # On récupère la suite de l'entretien
-    response = await get_llm_response_from_history(context.user_data['messages'])
-    context.user_data['messages'].append({"role": "assistant", "content": response})
-
-    await update.message.reply_text(response)
-
-# Nouvelle utilitaire pour gérer l'historique
 async def get_llm_response_from_history(messages):
+    """Appel avec historique pour le Bot 3"""
     response = client.chat.completions.create(
         model="google/gemini-2.0-flash-001",
         messages=messages
     )
     return response.choices[0].message.content
 
+# --- 3. GESTION DES DOCUMENTS (.md) ---
+async def set_document_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Définit quel document l'utilisateur s'apprête à envoyer"""
+    cmd = update.message.text.split()[0][4:] # Récupère 'cv', 'fiche' ou 'interviewer'
+    context.user_data['waiting_for'] = cmd
+    await update.message.reply_text(f"Envoie maintenant le fichier .md pour : {cmd.upper()}")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Télécharge et stocke le contenu du fichier Markdown"""
+    doc_type = context.user_data.get('waiting_for')
+    if not doc_type:
+        await update.message.reply_text("Utilise d'abord /setcv, /setfiche ou /setinterviewer")
+        return
+
+    try:
+        file = await context.bot.get_file(update.message.document.file_id)
+        content = await file.download_as_bytearray()
+        # Stockage dans context.user_data pour isoler par utilisateur
+        context.user_data[doc_type] = content.decode("utf-8")
+        context.user_data['waiting_for'] = None
+        await update.message.reply_text(f"✅ {doc_type.upper()} bien reçu et enregistré !")
+    except Exception as e:
+        await update.message.reply_text(f"Erreur lors de la lecture du fichier : {e}")
+
+# --- 4. LOGIQUE DES BOTS ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Bienvenue ! Voici tes commandes :\n"
+        "1️⃣ Config : /setcv, /setfiche, /setinterviewer\n"
+        "2️⃣ Bot 1 (Sourceur) : /parse\n"
+        "3️⃣ Bot 2 (Coach CV) : /cv\n"
+        "4️⃣ Bot 3 (Entretien) : /entretien puis /stop"
+    )
+
+async def parse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot 1 : Matching via Flux RSS"""
+    cv = context.user_data.get('cv')
+    if not cv:
+        await update.message.reply_text("❌ Envoie ton CV d'abord avec /setcv")
+        return
+
+    await update.message.reply_text("🔍 Analyse du flux RSS en cours...")
+    feed = feedparser.parse(os.getenv("RSS_URL"))
+    
+    # Mode démo si le flux est vide
+    if not feed.entries:
+        await update.message.reply_text("⚠️ Flux vide, utilisation d'offres de test.")
+        jobs = "1. Dev IA chez TechCorp (Paris)\n2. Data Analyst chez DataSoft (Lyon)"
+    else:
+        jobs = "\n".join([f"- {e.title}: {e.link}" for e in feed.entries[:5]])
+
+    prompt = f"Voici mon CV :\n{cv}\n\nVoici des offres :\n{jobs}\n\nSélectionne les 2 meilleures et justifie."
+    res = await get_llm_response(prompt)
+    await update.message.reply_text(res)
+
+async def cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot 2 : Analyse comparative CV/Fiche"""
+    cv, fiche = context.user_data.get('cv'), context.user_data.get('fiche')
+    if not cv or not fiche:
+        await update.message.reply_text("❌ Il me manque le CV ou la Fiche de poste.")
+        return
+
+    await update.message.reply_text("📊 Comparaison détaillée en cours...")
+    prompt = f"Analyse le match entre ce CV :\n{cv}\n\net cette offre :\n{fiche}\n\nDonne un score sur 100 et des conseils de reformulation."
+    res = await get_llm_response(prompt)
+    await update.message.reply_text(res)
+
+async def entretien_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot 3 : Initialisation de la simulation"""
+    cv = context.user_data.get('cv')
+    fiche = context.user_data.get('fiche')
+    interviewer = context.user_data.get('interviewer')
+
+    if not all([cv, fiche, interviewer]):
+        await update.message.reply_text("❌ Documents manquants (CV, Fiche ou Interviewer).")
+        return
+
+    await update.message.reply_text("🎤 L'entretien commence. Le recruteur se prépare...")
+
+    # Création du persona et de l'historique
+    context.user_data['messages'] = [
+        {"role": "system", "content": f"Tu es {interviewer}. Tu recrutes pour : {fiche}. Le candidat est : {cv}. Pose une question à la fois. Ajoute toujours un feedback entre crochets [COACH: ...]."}
+    ]
+    context.user_data['messages'].append({"role": "user", "content": "Bonjour, je suis prêt pour l'entretien."})
+    
+    try:
+        response = await get_llm_response_from_history(context.user_data['messages'])
+        context.user_data['messages'].append({"role": "assistant", "content": response})
+        await update.message.reply_text(response)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur IA : {e}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot 3 : Boucle de conversation pour l'entretien"""
+    if 'messages' not in context.user_data:
+        return # On ignore si l'entretien n'a pas démarré
+
+    user_text = update.message.text
+    context.user_data['messages'].append({"role": "user", "content": user_text})
+
+    try:
+        response = await get_llm_response_from_history(context.user_data['messages'])
+        context.user_data['messages'].append({"role": "assistant", "content": response})
+        await update.message.reply_text(response)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur IA : {e}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot 3 : Bilan final"""
     if 'messages' not in context.user_data:
         return
 
-    await update.message.reply_text("🏁 Fin de l'entretien. Calcul du bilan final...")
-    
+    await update.message.reply_text("🏁 Entretien terminé. Génération du bilan...")
     history = str(context.user_data['messages'])
-    prompt = f"Analyse cet historique d'entretien : {history}. Donne une note sur 10, les points forts, et 3 axes d'amélioration."
-    
-    bilan = await get_llm_response(prompt)
+    bilan = await get_llm_response(f"Fais un bilan critique de cet entretien (points forts/faibles) : {history}")
     await update.message.reply_text(bilan)
-    
-    # Reset de la session
-    del context.user_data['messages']
+    del context.user_data['messages'] # Nettoyage de la session
 
-# --- MAIN ---
+# --- 5. LANCEMENT DU BOT ---
 if __name__ == '__main__':
+    # Correctif pour éviter les erreurs asyncio sur Windows
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Handlers fichiers
+    # Handlers Fichiers
     for cmd in ['setcv', 'setfiche', 'setinterviewer']:
         app.add_handler(CommandHandler(cmd, set_document_type))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Handlers actions
+    # Handlers Commandes
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("parse", parse_command))
     app.add_handler(CommandHandler("cv", cv_command))
     app.add_handler(CommandHandler("entretien", entretien_command))
     app.add_handler(CommandHandler("stop", stop_command))
-    # Ce handler doit être à la fin pour ne pas intercepter les commandes
+    
+    # Handler Texte (doit être en dernier)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot en ligne...")
+    print("🚀 Bot en ligne ! (CTRL+C pour arrêter)")
     app.run_polling()
